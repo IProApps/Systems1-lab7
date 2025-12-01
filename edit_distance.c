@@ -8,22 +8,24 @@
 
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define MIN3(a,b,c) MIN(MIN(a,b),c)
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
 #define TILE_SIZE 256
-#define NUM_THREADS 8
+#define NUM_THREADS 4
 
 typedef struct {
     const char *str1;
     const char *str2;
     size_t len;
-    int *buffer;  // Circular buffer for stripes
-    int stripe_width;
+    int **diagonals;  // Store anti-diagonals
+    int max_diag_stored;
     int tile_i;
     int tile_j;
     int tile_size;
     int num_tiles;
     volatile int **tile_done;
-    pthread_mutex_t *locks;
-    pthread_cond_t *conds;
+    pthread_mutex_t *tile_locks;
+    pthread_cond_t *tile_conds;
+    pthread_mutex_t diag_lock;
 } tile_work_t;
 
 typedef struct {
@@ -39,27 +41,52 @@ typedef struct {
     int shutdown;
 } threadpool_t;
 
-// Get value from circular stripe buffer
-static inline int get_cell(int *buffer, int i, int j, int stripe_width, int len) {
+// Get value from anti-diagonal storage
+// Cell (i,j) is on anti-diagonal d = i+j
+// Position in that diagonal: min(i,j)
+static inline int get_diag_cell(int **diagonals, int i, int j, int len, int max_stored) {
     if (i < 0 || j < 0 || i > len || j > len) return 0;
-    int stripe_idx = i % stripe_width;
-    return buffer[stripe_idx * (len + 1) + j];
+    
+    int diag_num = i + j;
+    int diag_stored = diag_num % max_stored;
+    
+    // Position in anti-diagonal
+    int pos = (i <= j) ? i : j;
+    
+    return diagonals[diag_stored][pos];
 }
 
-// Set value in circular stripe buffer
-static inline void set_cell(int *buffer, int i, int j, int val, int stripe_width, int len) {
-    int stripe_idx = i % stripe_width;
-    buffer[stripe_idx * (len + 1) + j] = val;
+static inline void set_diag_cell(int **diagonals, int i, int j, int val, int len, int max_stored) {
+    int diag_num = i + j;
+    int diag_stored = diag_num % max_stored;
+    
+    int pos = (i <= j) ? i : j;
+    
+    diagonals[diag_stored][pos] = val;
 }
 
-void compute_tile_avx2(tile_work_t *work) {
+void compute_tile_antidiag(tile_work_t *work) {
     int tile_start_i = work->tile_i * work->tile_size;
     int tile_start_j = work->tile_j * work->tile_size;
     int tile_end_i = MIN(tile_start_i + work->tile_size, work->len + 1);
     int tile_end_j = MIN(tile_start_j + work->tile_size, work->len + 1);
     
-    for (int i = tile_start_i; i < tile_end_i; i++) {
-        for (int j = tile_start_j; j < tile_end_j; j++) {
+    // Process tile by anti-diagonals within the tile
+    int min_diag = tile_start_i + tile_start_j;
+    int max_diag = (tile_end_i - 1) + (tile_end_j - 1);
+    
+    pthread_mutex_lock(&work->diag_lock);
+    
+    for (int d = min_diag; d <= max_diag; d++) {
+        // For diagonal d, find cells (i,j) where i+j=d and both are in tile bounds
+        int start_i = MAX(tile_start_i, d - tile_end_j + 1);
+        int end_i = MIN(tile_end_i - 1, d - tile_start_j);
+        
+        for (int i = start_i; i <= end_i; i++) {
+            int j = d - i;
+            
+            if (j < tile_start_j || j >= tile_end_j) continue;
+            
             int val;
             if (i == 0) {
                 val = j;
@@ -67,14 +94,17 @@ void compute_tile_avx2(tile_work_t *work) {
                 val = i;
             } else {
                 int cost = (work->str1[i - 1] == work->str2[j - 1]) ? 0 : 1;
-                int from_diag = get_cell(work->buffer, i - 1, j - 1, work->stripe_width, work->len) + cost;
-                int from_top = get_cell(work->buffer, i - 1, j, work->stripe_width, work->len) + 1;
-                int from_left = get_cell(work->buffer, i, j - 1, work->stripe_width, work->len) + 1;
-                val = MIN3(from_diag, from_top, from_left);
+                int from_diag = get_diag_cell(work->diagonals, i - 1, j - 1, work->len, work->max_diag_stored);
+                int from_top = get_diag_cell(work->diagonals, i - 1, j, work->len, work->max_diag_stored);
+                int from_left = get_diag_cell(work->diagonals, i, j - 1, work->len, work->max_diag_stored);
+                val = MIN3(from_diag + cost, from_top + 1, from_left + 1);
             }
-            set_cell(work->buffer, i, j, val, work->stripe_width, work->len);
+            
+            set_diag_cell(work->diagonals, i, j, val, work->len, work->max_diag_stored);
         }
     }
+    
+    pthread_mutex_unlock(&work->diag_lock);
 }
 
 void *thread_do_work(void *pool_ptr) {
@@ -99,14 +129,34 @@ void *thread_do_work(void *pool_ptr) {
         pthread_mutex_unlock(&pool->lock);
         
         if (work) {
-            compute_tile_avx2(work);
+            // Wait for dependencies
+            if (work->tile_i > 0) {
+                int dep_idx = (work->tile_i - 1) * work->num_tiles + work->tile_j;
+                pthread_mutex_lock(&work->tile_locks[dep_idx]);
+                while (!work->tile_done[work->tile_i - 1][work->tile_j]) {
+                    pthread_cond_wait(&work->tile_conds[dep_idx], &work->tile_locks[dep_idx]);
+                }
+                pthread_mutex_unlock(&work->tile_locks[dep_idx]);
+            }
             
-            // Mark tile as done
+            if (work->tile_j > 0) {
+                int dep_idx = work->tile_i * work->num_tiles + (work->tile_j - 1);
+                pthread_mutex_lock(&work->tile_locks[dep_idx]);
+                while (!work->tile_done[work->tile_i][work->tile_j - 1]) {
+                    pthread_cond_wait(&work->tile_conds[dep_idx], &work->tile_locks[dep_idx]);
+                }
+                pthread_mutex_unlock(&work->tile_locks[dep_idx]);
+            }
+            
+            // Compute the tile
+            compute_tile_antidiag(work);
+            
+            // Mark as done
             int tile_idx = work->tile_i * work->num_tiles + work->tile_j;
-            pthread_mutex_lock(&work->locks[tile_idx]);
+            pthread_mutex_lock(&work->tile_locks[tile_idx]);
             work->tile_done[work->tile_i][work->tile_j] = 1;
-            pthread_cond_broadcast(&work->conds[tile_idx]);
-            pthread_mutex_unlock(&work->locks[tile_idx]);
+            pthread_cond_broadcast(&work->tile_conds[tile_idx]);
+            pthread_mutex_unlock(&work->tile_locks[tile_idx]);
             
             free(work);
         }
@@ -166,7 +216,7 @@ void threadpool_destroy(threadpool_t *pool) {
 int cse2421_edit_distance(const char *str1, const char *str2, size_t len) {
     if (len == 0) return 0;
     
-    // For small inputs, use simple sequential algorithm with 2 rows
+    // For small inputs, use simple sequential algorithm
     if (len < 1000) {
         int *prev_row = malloc((len + 1) * sizeof(int));
         int *curr_row = malloc((len + 1) * sizeof(int));
@@ -192,104 +242,96 @@ int cse2421_edit_distance(const char *str1, const char *str2, size_t len) {
         return result;
     }
     
-    // For large inputs, use wavefront tiled parallelism
     int tile_size = TILE_SIZE;
     int num_tiles = (len + tile_size) / tile_size;
     
-    // Allocate circular buffer for stripes
-    // We only need enough stripes to cover tile dependencies
-    int stripe_width = tile_size + 1;
-    int *buffer = aligned_alloc(32, stripe_width * (len + 1) * sizeof(int));
-    memset(buffer, 0, stripe_width * (len + 1) * sizeof(int));
+    // Allocate anti-diagonal storage
+    // We need to store enough diagonals to handle tile dependencies
+    // Maximum anti-diagonal number is 2*len, but we only keep recent ones
+    int max_diag_stored = 2 * tile_size + 2;
     
-    // Initialize first row
-    for (size_t j = 0; j <= len; j++) {
-        set_cell(buffer, 0, j, j, stripe_width, len);
+    int **diagonals = malloc(max_diag_stored * sizeof(int *));
+    for (int d = 0; d < max_diag_stored; d++) {
+        // Each anti-diagonal d has min(d+1, 2*len+1-d) elements
+        // For simplicity, allocate max size (len+1)
+        diagonals[d] = aligned_alloc(32, (len + 1) * sizeof(int));
+        memset(diagonals[d], 0, (len + 1) * sizeof(int));
     }
     
-    // Initialize first column in buffer
-    for (int i = 1; i < stripe_width && i <= len; i++) {
-        set_cell(buffer, i, 0, i, stripe_width, len);
+    // Initialize first row and column (anti-diagonals 0 through len)
+    for (int d = 0; d <= len && d < max_diag_stored; d++) {
+        int diag_stored = d % max_diag_stored;
+        for (int i = 0; i <= d && i <= len; i++) {
+            int j = d - i;
+            if (j > len) continue;
+            
+            int val;
+            if (i == 0) val = j;
+            else if (j == 0) val = i;
+            else val = 0;  // Will be computed
+            
+            int pos = (i <= j) ? i : j;
+            diagonals[diag_stored][pos] = val;
+        }
     }
     
     threadpool_t *pool = threadpool_create(NUM_THREADS);
     
-    // Allocate synchronization structures
     int total_tiles = num_tiles * num_tiles;
-    pthread_mutex_t *locks = malloc(sizeof(pthread_mutex_t) * total_tiles);
-    pthread_cond_t *conds = malloc(sizeof(pthread_cond_t) * total_tiles);
+    pthread_mutex_t *tile_locks = malloc(sizeof(pthread_mutex_t) * total_tiles);
+    pthread_cond_t *tile_conds = malloc(sizeof(pthread_cond_t) * total_tiles);
     volatile int **tile_done = malloc(sizeof(volatile int *) * num_tiles);
+    pthread_mutex_t diag_lock;
+    pthread_mutex_init(&diag_lock, NULL);
     
     for (int i = 0; i < num_tiles; i++) {
         tile_done[i] = calloc(num_tiles, sizeof(volatile int));
     }
     
     for (int i = 0; i < total_tiles; i++) {
-        pthread_mutex_init(&locks[i], NULL);
-        pthread_cond_init(&conds[i], NULL);
+        pthread_mutex_init(&tile_locks[i], NULL);
+        pthread_cond_init(&tile_conds[i], NULL);
     }
     
-    // Process tiles in wavefront (anti-diagonal) order
-    // Tiles on the same anti-diagonal can execute in parallel
-    for (int wave = 0; wave < 2 * num_tiles - 1; wave++) {
-        for (int tile_i = 0; tile_i < num_tiles; tile_i++) {
-            int tile_j = wave - tile_i;
-            
-            if (tile_j < 0 || tile_j >= num_tiles) continue;
-            
-            // Wait for dependencies: tile above (tile_i-1, tile_j) and tile to left (tile_i, tile_j-1)
-            if (tile_i > 0) {
-                int dep_idx = (tile_i - 1) * num_tiles + tile_j;
-                pthread_mutex_lock(&locks[dep_idx]);
-                while (!tile_done[tile_i - 1][tile_j]) {
-                    pthread_cond_wait(&conds[dep_idx], &locks[dep_idx]);
-                }
-                pthread_mutex_unlock(&locks[dep_idx]);
-            }
-            
-            if (tile_j > 0) {
-                int dep_idx = tile_i * num_tiles + (tile_j - 1);
-                pthread_mutex_lock(&locks[dep_idx]);
-                while (!tile_done[tile_i][tile_j - 1]) {
-                    pthread_cond_wait(&conds[dep_idx], &locks[dep_idx]);
-                }
-                pthread_mutex_unlock(&locks[dep_idx]);
-            }
-            
-            // Create work item for this tile
+    // Submit all tiles - they'll execute in wavefront order due to dependencies
+    for (int tile_i = 0; tile_i < num_tiles; tile_i++) {
+        for (int tile_j = 0; tile_j < num_tiles; tile_j++) {
             tile_work_t *work = malloc(sizeof(tile_work_t));
             work->str1 = str1;
             work->str2 = str2;
             work->len = len;
-            work->buffer = buffer;
-            work->stripe_width = stripe_width;
+            work->diagonals = diagonals;
+            work->max_diag_stored = max_diag_stored;
             work->tile_i = tile_i;
             work->tile_j = tile_j;
             work->tile_size = tile_size;
             work->num_tiles = num_tiles;
             work->tile_done = tile_done;
-            work->locks = locks;
-            work->conds = conds;
+            work->tile_locks = tile_locks;
+            work->tile_conds = tile_conds;
+            work->diag_lock = diag_lock;
             
             threadpool_add(pool, work);
         }
     }
     
-    // Wait for the last tile to complete
+    // Wait for last tile
     int last_tile_idx = (num_tiles - 1) * num_tiles + (num_tiles - 1);
-    pthread_mutex_lock(&locks[last_tile_idx]);
+    pthread_mutex_lock(&tile_locks[last_tile_idx]);
     while (!tile_done[num_tiles - 1][num_tiles - 1]) {
-        pthread_cond_wait(&conds[last_tile_idx], &locks[last_tile_idx]);
+        pthread_cond_wait(&tile_conds[last_tile_idx], &tile_locks[last_tile_idx]);
     }
-    pthread_mutex_unlock(&locks[last_tile_idx]);
+    pthread_mutex_unlock(&tile_locks[last_tile_idx]);
     
-    int result = get_cell(buffer, len, len, stripe_width, len);
+    int result = get_diag_cell(diagonals, len, len, len, max_diag_stored);
     
     threadpool_destroy(pool);
     
+    pthread_mutex_destroy(&diag_lock);
+    
     for (int i = 0; i < total_tiles; i++) {
-        pthread_mutex_destroy(&locks[i]);
-        pthread_cond_destroy(&conds[i]);
+        pthread_mutex_destroy(&tile_locks[i]);
+        pthread_cond_destroy(&tile_conds[i]);
     }
     
     for (int i = 0; i < num_tiles; i++) {
@@ -297,9 +339,13 @@ int cse2421_edit_distance(const char *str1, const char *str2, size_t len) {
     }
     
     free(tile_done);
-    free(locks);
-    free(conds);
-    free(buffer);
+    free(tile_locks);
+    free(tile_conds);
+    
+    for (int d = 0; d < max_diag_stored; d++) {
+        free(diagonals[d]);
+    }
+    free(diagonals);
     
     return result;
 }
