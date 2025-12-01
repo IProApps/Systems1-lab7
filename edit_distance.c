@@ -10,7 +10,7 @@
 #define MIN3(a,b,c) MIN(MIN(a,b),c)
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 #define TILE_SIZE 256
-#define NUM_THREADS 4
+#define NUM_THREADS 2
 
 typedef struct {
     const char *str1;
