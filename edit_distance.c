@@ -8,7 +8,7 @@
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define MIN3(a,b,c) MIN(MIN(a,b),c)
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
-#define TILE_SIZE 512
+#define TILE_SIZE 256
 #define NUM_THREADS 16
 
 typedef struct {
@@ -17,43 +17,33 @@ typedef struct {
     size_t len;
     int **diagonals;
     int max_diag_stored;
-    int tile_i;
-    int tile_j;
-    int tile_size;
     int num_tiles;
-    volatile int *tile_ready;  // Flattened 1D array
-} tile_work_t;
+    volatile int *tile_ready;
+    volatile int *next_wavefront_tile;
+    pthread_mutex_t *wavefront_lock;
+} shared_data_t;
 
-typedef struct {
-    pthread_mutex_t lock;
-    pthread_cond_t notify;
-    pthread_t *threads;
-    tile_work_t **tasks;
-    int head;
-    int tail;
-    int count;
-    int capacity;
-    int shutdown;
-} threadpool_t;
-
-// Simplified diagonal access - no locks needed for reads
-static inline int get_diag(int **diag, int i, int j, int len, int max_stored) {
-    if (i < 0 || j < 0 || i > len || j > len) return 0;
+// Simplified diagonal access
+static inline int get_diag(int **diag, int i, int j, int max_stored) {
     int d = (i + j) % max_stored;
     return diag[d][MIN(i, j)];
 }
 
-// Direct write - diagonal locks removed, dependency ordering ensures safety
 static inline void set_diag(int **diag, int i, int j, int val, int max_stored) {
     int d = (i + j) % max_stored;
     diag[d][MIN(i, j)] = val;
 }
 
-void compute_tile_avx2(tile_work_t *w) {
-    int si = w->tile_i * w->tile_size;
-    int sj = w->tile_j * w->tile_size;
-    int ei = MIN(si + w->tile_size, w->len + 1);
-    int ej = MIN(sj + w->tile_size, w->len + 1);
+// True AVX2 SIMD minimum
+static inline __m256i min3_avx2(__m256i a, __m256i b, __m256i c) {
+    return _mm256_min_epi32(_mm256_min_epi32(a, b), c);
+}
+
+void compute_tile_avx2(shared_data_t *shared, int tile_i, int tile_j) {
+    int si = tile_i * TILE_SIZE;
+    int sj = tile_j * TILE_SIZE;
+    int ei = MIN(si + TILE_SIZE, shared->len + 1);
+    int ej = MIN(sj + TILE_SIZE, shared->len + 1);
     
     // Process anti-diagonals within tile
     for (int d = si + sj; d < ei + ej - 1; d++) {
@@ -62,44 +52,62 @@ void compute_tile_avx2(tile_work_t *w) {
         
         int i = start_i;
         
-        // Boundaries
+        // Handle boundaries
         while (i <= end_i && (i == 0 || (d - i) == 0)) {
             int j = d - i;
             if (j >= sj && j < ej) {
-                set_diag(w->diagonals, i, j, (i == 0) ? j : i, w->max_diag_stored);
+                set_diag(shared->diagonals, i, j, (i == 0) ? j : i, shared->max_diag_stored);
             }
             i++;
         }
         
-        // AVX2 vectorized interior (8 cells at a time)
+        // AVX2 vectorized interior - 8 cells at once
         for (; i + 7 <= end_i; i += 8) {
-            __m256i costs, diag_vals, top_vals, left_vals, results;
-            int vals[8];
+            int costs[8] __attribute__((aligned(32)));
+            int diag_vals[8] __attribute__((aligned(32)));
+            int top_vals[8] __attribute__((aligned(32)));
+            int left_vals[8] __attribute__((aligned(32)));
+            int results[8] __attribute__((aligned(32)));
+            int valid[8];
             
-            // Gather dependencies and compute
+            // Gather phase
             for (int k = 0; k < 8; k++) {
                 int ii = i + k;
                 int jj = d - ii;
                 
-                if (jj < sj || jj >= ej) {
-                    vals[k] = 0;
+                if (jj < sj || jj >= ej || ii >= ei) {
+                    valid[k] = 0;
+                    costs[k] = diag_vals[k] = top_vals[k] = left_vals[k] = 0;
                     continue;
                 }
                 
-                int cost = (w->str1[ii - 1] != w->str2[jj - 1]);
-                int diag = get_diag(w->diagonals, ii - 1, jj - 1, w->len, w->max_diag_stored);
-                int top = get_diag(w->diagonals, ii - 1, jj, w->len, w->max_diag_stored);
-                int left = get_diag(w->diagonals, ii, jj - 1, w->len, w->max_diag_stored);
-                
-                vals[k] = MIN3(diag + cost, top + 1, left + 1);
+                valid[k] = 1;
+                costs[k] = (shared->str1[ii - 1] != shared->str2[jj - 1]) ? 1 : 0;
+                diag_vals[k] = get_diag(shared->diagonals, ii - 1, jj - 1, shared->max_diag_stored);
+                top_vals[k] = get_diag(shared->diagonals, ii - 1, jj, shared->max_diag_stored);
+                left_vals[k] = get_diag(shared->diagonals, ii, jj - 1, shared->max_diag_stored);
             }
             
-            // Store results
+            // SIMD computation
+            __m256i cost_vec = _mm256_load_si256((__m256i*)costs);
+            __m256i diag_vec = _mm256_load_si256((__m256i*)diag_vals);
+            __m256i top_vec = _mm256_load_si256((__m256i*)top_vals);
+            __m256i left_vec = _mm256_load_si256((__m256i*)left_vals);
+            __m256i ones = _mm256_set1_epi32(1);
+            
+            __m256i diag_cost = _mm256_add_epi32(diag_vec, cost_vec);
+            __m256i top_plus1 = _mm256_add_epi32(top_vec, ones);
+            __m256i left_plus1 = _mm256_add_epi32(left_vec, ones);
+            
+            __m256i result_vec = min3_avx2(diag_cost, top_plus1, left_plus1);
+            _mm256_store_si256((__m256i*)results, result_vec);
+            
+            // Scatter phase
             for (int k = 0; k < 8; k++) {
-                int ii = i + k;
-                int jj = d - ii;
-                if (jj >= sj && jj < ej) {
-                    set_diag(w->diagonals, ii, jj, vals[k], w->max_diag_stored);
+                if (valid[k]) {
+                    int ii = i + k;
+                    int jj = d - ii;
+                    set_diag(shared->diagonals, ii, jj, results[k], shared->max_diag_stored);
                 }
             }
         }
@@ -109,115 +117,76 @@ void compute_tile_avx2(tile_work_t *w) {
             int j = d - i;
             if (j < sj || j >= ej) continue;
             
-            int cost = (w->str1[i - 1] != w->str2[j - 1]) ? 1 : 0;
-            int diag = get_diag(w->diagonals, i - 1, j - 1, w->len, w->max_diag_stored);
-            int top = get_diag(w->diagonals, i - 1, j, w->len, w->max_diag_stored);
-            int left = get_diag(w->diagonals, i, j - 1, w->len, w->max_diag_stored);
+            int cost = (shared->str1[i - 1] != shared->str2[j - 1]) ? 1 : 0;
+            int diag = get_diag(shared->diagonals, i - 1, j - 1, shared->max_diag_stored);
+            int top = get_diag(shared->diagonals, i - 1, j, shared->max_diag_stored);
+            int left = get_diag(shared->diagonals, i, j - 1, shared->max_diag_stored);
             
-            set_diag(w->diagonals, i, j, MIN3(diag + cost, top + 1, left + 1), w->max_diag_stored);
+            set_diag(shared->diagonals, i, j, MIN3(diag + cost, top + 1, left + 1), shared->max_diag_stored);
         }
     }
 }
 
 void *worker_thread(void *arg) {
-    threadpool_t *pool = (threadpool_t *)arg;
+    shared_data_t *shared = (shared_data_t *)arg;
+    int num_wavefronts = 2 * shared->num_tiles - 1;
     
-    while (1) {
-        pthread_mutex_lock(&pool->lock);
-        
-        while (pool->count == 0 && !pool->shutdown) {
-            pthread_cond_wait(&pool->notify, &pool->lock);
-        }
-        
-        if (pool->shutdown && pool->count == 0) {
-            pthread_mutex_unlock(&pool->lock);
-            return NULL;
-        }
-        
-        tile_work_t *work = pool->tasks[pool->head];
-        pool->head = (pool->head + 1) % pool->capacity;
-        pool->count--;
-        
-        pthread_mutex_unlock(&pool->lock);
-        
-        if (work) {
-            // Wait for dependencies using atomic check
-            int dep_left = work->tile_i * work->num_tiles + (work->tile_j - 1);
-            int dep_top = (work->tile_i - 1) * work->num_tiles + work->tile_j;
+    // Process wavefronts
+    for (int wave = 0; wave < num_wavefronts; wave++) {
+        while (1) {
+            // Try to claim a tile from this wavefront
+            pthread_mutex_lock(shared->wavefront_lock);
+            int tile_idx = __atomic_load_n(&shared->next_wavefront_tile[wave], __ATOMIC_ACQUIRE);
             
-            if (work->tile_j > 0) {
-                while (!__atomic_load_n(&work->tile_ready[dep_left], __ATOMIC_ACQUIRE)) {
+            // Calculate how many tiles are in this wavefront
+            int wave_start_i = MAX(0, wave - (shared->num_tiles - 1));
+            int wave_end_i = MIN(wave, shared->num_tiles - 1);
+            int tiles_in_wave = wave_end_i - wave_start_i + 1;
+            
+            if (tile_idx >= tiles_in_wave) {
+                pthread_mutex_unlock(shared->wavefront_lock);
+                break; // No more tiles in this wavefront
+            }
+            
+            __atomic_store_n(&shared->next_wavefront_tile[wave], tile_idx + 1, __ATOMIC_RELEASE);
+            pthread_mutex_unlock(shared->wavefront_lock);
+            
+            // Calculate actual tile coordinates
+            int tile_i = wave_start_i + tile_idx;
+            int tile_j = wave - tile_i;
+            
+            // Wait for dependencies
+            if (tile_i > 0) {
+                int dep_idx = (tile_i - 1) * shared->num_tiles + tile_j;
+                while (!__atomic_load_n(&shared->tile_ready[dep_idx], __ATOMIC_ACQUIRE)) {
                     __builtin_ia32_pause();
                 }
             }
             
-            if (work->tile_i > 0) {
-                while (!__atomic_load_n(&work->tile_ready[dep_top], __ATOMIC_ACQUIRE)) {
+            if (tile_j > 0) {
+                int dep_idx = tile_i * shared->num_tiles + (tile_j - 1);
+                while (!__atomic_load_n(&shared->tile_ready[dep_idx], __ATOMIC_ACQUIRE)) {
                     __builtin_ia32_pause();
                 }
             }
             
             // Compute tile
-            compute_tile_avx2(work);
+            compute_tile_avx2(shared, tile_i, tile_j);
             
             // Mark done
-            int my_idx = work->tile_i * work->num_tiles + work->tile_j;
-            __atomic_store_n(&work->tile_ready[my_idx], 1, __ATOMIC_RELEASE);
-            
-            free(work);
+            int my_idx = tile_i * shared->num_tiles + tile_j;
+            __atomic_store_n(&shared->tile_ready[my_idx], 1, __ATOMIC_RELEASE);
         }
     }
-}
-
-threadpool_t *create_pool(int n) {
-    threadpool_t *p = malloc(sizeof(threadpool_t));
-    p->shutdown = 0;
-    p->head = p->tail = p->count = 0;
-    p->capacity = 8192;
-    p->tasks = malloc(sizeof(tile_work_t *) * p->capacity);
     
-    pthread_mutex_init(&p->lock, NULL);
-    pthread_cond_init(&p->notify, NULL);
-    
-    p->threads = malloc(sizeof(pthread_t) * n);
-    for (int i = 0; i < n; i++) {
-        pthread_create(&p->threads[i], NULL, worker_thread, p);
-    }
-    
-    return p;
-}
-
-void add_task(threadpool_t *p, tile_work_t *w) {
-    pthread_mutex_lock(&p->lock);
-    p->tasks[p->tail] = w;
-    p->tail = (p->tail + 1) % p->capacity;
-    p->count++;
-    pthread_cond_signal(&p->notify);
-    pthread_mutex_unlock(&p->lock);
-}
-
-void destroy_pool(threadpool_t *p, int n) {
-    pthread_mutex_lock(&p->lock);
-    p->shutdown = 1;
-    pthread_mutex_unlock(&p->lock);
-    pthread_cond_broadcast(&p->notify);
-    
-    for (int i = 0; i < n; i++) {
-        pthread_join(p->threads[i], NULL);
-    }
-    
-    free(p->threads);
-    free(p->tasks);
-    pthread_mutex_destroy(&p->lock);
-    pthread_cond_destroy(&p->notify);
-    free(p);
+    return NULL;
 }
 
 int cse2421_edit_distance(const char *str1, const char *str2, size_t len) {
     if (len == 0) return 0;
     
     // Small input optimization
-    if (len < 800) {
+    if (len < 1000) {
         int *prev = malloc((len + 1) * sizeof(int));
         int *curr = malloc((len + 1) * sizeof(int));
         
@@ -241,7 +210,7 @@ int cse2421_edit_distance(const char *str1, const char *str2, size_t len) {
     int num_tiles = (len + TILE_SIZE - 1) / TILE_SIZE;
     int max_stored = 2 * TILE_SIZE + 2;
     
-    // Allocate diagonal storage (no per-diagonal locks)
+    // Allocate diagonal storage
     int **diagonals = malloc(max_stored * sizeof(int *));
     for (int d = 0; d < max_stored; d++) {
         diagonals[d] = aligned_alloc(32, (len + 1) * sizeof(int));
@@ -258,46 +227,46 @@ int cse2421_edit_distance(const char *str1, const char *str2, size_t len) {
         }
     }
     
-    // Create tile ready flags (atomic spinlock array)
-    volatile int *tile_ready = calloc(num_tiles * num_tiles, sizeof(int));
+    // Setup shared data
+    shared_data_t shared;
+    shared.str1 = str1;
+    shared.str2 = str2;
+    shared.len = len;
+    shared.diagonals = diagonals;
+    shared.max_diag_stored = max_stored;
+    shared.num_tiles = num_tiles;
+    shared.tile_ready = calloc(num_tiles * num_tiles, sizeof(int));
     
-    threadpool_t *pool = create_pool(NUM_THREADS);
+    // Wavefront coordination
+    int num_wavefronts = 2 * num_tiles - 1;
+    shared.next_wavefront_tile = calloc(num_wavefronts, sizeof(int));
+    shared.wavefront_lock = malloc(sizeof(pthread_mutex_t));
+    pthread_mutex_init(shared.wavefront_lock, NULL);
     
-    // Submit all tiles
-    for (int ti = 0; ti < num_tiles; ti++) {
-        for (int tj = 0; tj < num_tiles; tj++) {
-            tile_work_t *w = malloc(sizeof(tile_work_t));
-            w->str1 = str1;
-            w->str2 = str2;
-            w->len = len;
-            w->diagonals = diagonals;
-            w->max_diag_stored = max_stored;
-            w->tile_i = ti;
-            w->tile_j = tj;
-            w->tile_size = TILE_SIZE;
-            w->num_tiles = num_tiles;
-            w->tile_ready = tile_ready;
-            
-            add_task(pool, w);
-        }
+    // Create worker threads
+    pthread_t threads[NUM_THREADS];
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_create(&threads[i], NULL, worker_thread, &shared);
     }
     
-    // Wait for last tile
-    int last_idx = (num_tiles - 1) * num_tiles + (num_tiles - 1);
-    while (!__atomic_load_n(&tile_ready[last_idx], __ATOMIC_ACQUIRE)) {
-        __builtin_ia32_pause();
+    // Wait for completion
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
     }
     
-    int result = get_diag(diagonals, len, len, len, max_stored);
+    // Extract result
+    int result = get_diag(diagonals, len, len, max_stored);
     
     // Cleanup
-    destroy_pool(pool, NUM_THREADS);
+    pthread_mutex_destroy(shared.wavefront_lock);
+    free(shared.wavefront_lock);
+    free((void *)shared.next_wavefront_tile);
+    free((void *)shared.tile_ready);
     
     for (int d = 0; d < max_stored; d++) {
         free(diagonals[d]);
     }
     free(diagonals);
-    free((void *)tile_ready);
     
     return result;
 }
