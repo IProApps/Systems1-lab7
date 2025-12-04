@@ -104,17 +104,11 @@ void compute_tile_AVX2(
     int32_t *out_bottom,
     int32_t *out_right)
 {
-    // Vector size (8 int32_t values per AVX2 register)
-    const int VEC = 8;
-    
-    // Aligned buffers for current and previous rows
     int32_t __attribute__((aligned(32))) prev_row[TILE_SIZE + 1];
     int32_t __attribute__((aligned(32))) curr_row[TILE_SIZE + 1];
     
-    // Constants
     __m256i ones = _mm256_set1_epi32(1);
     
-    // Initialize previous row with top_left_val and top_vals
     prev_row[0] = top_left_val;
     memcpy(&prev_row[1], top_vals, TILE_SIZE * sizeof(int32_t));
 
@@ -122,48 +116,39 @@ void compute_tile_AVX2(
         char a = subA[r];
         curr_row[0] = left_vals[r];
         
-        // Broadcast character 'a' to all lanes for comparison
-        __m256i char_a_vec = _mm256_set1_epi8(a);
-        
-        for (int c = 0; c < TILE_SIZE; c += VEC) {
-            // Load 8 characters from subB
-            // Note: We load as 64-bit values then unpack to get proper alignment
+        for (int c = 0; c < TILE_SIZE; c += 8) {
+            // Vectorized character comparison and cost calculation
             __m128i subB_chars_128 = _mm_loadl_epi64((const __m128i*)&subB[c]);
             __m256i subB_chars = _mm256_cvtepi8_epi32(subB_chars_128);
-            
-            // Broadcast char_a to 32-bit lanes for comparison
             __m256i char_a_32 = _mm256_set1_epi32((int32_t)a);
-            
-            // Compare: cost = (char_a == char_b) ? 0 : 1
             __m256i eq_mask = _mm256_cmpeq_epi32(char_a_32, subB_chars);
-            __m256i cost = _mm256_andnot_si256(eq_mask, ones); // invert mask and AND with 1
+            __m256i cost = _mm256_andnot_si256(eq_mask, ones);
             
-            // Load values from previous and current rows
+            // Load independent values
             __m256i prev_diag = _mm256_loadu_si256((const __m256i*)&prev_row[c]);
             __m256i prev_top = _mm256_loadu_si256((const __m256i*)&prev_row[c + 1]);
-            __m256i curr_left = _mm256_loadu_si256((const __m256i*)&curr_row[c]);
             
-            // Compute insertion, deletion, substitution
-            __m256i ins = _mm256_add_epi32(prev_top, ones);
-            __m256i del = _mm256_add_epi32(curr_left, ones);
+            // Compute substitution and insertion costs (fully parallel)
             __m256i sub = _mm256_add_epi32(prev_diag, cost);
+            __m256i ins = _mm256_add_epi32(prev_top, ones);
             
-            // Find minimum
-            __m256i min_id = _mm256_min_epi32(ins, del);
-            __m256i result = _mm256_min_epi32(min_id, sub);
+            // Store temporarily for scalar processing
+            int32_t sub_arr[8], ins_arr[8];
+            _mm256_storeu_si256((__m256i*)sub_arr, sub);
+            _mm256_storeu_si256((__m256i*)ins_arr, ins);
             
-            // Store result
-            _mm256_storeu_si256((__m256i*)&curr_row[c + 1], result);
+            // Sequential computation with dependency chain
+            for (int i = 0; i < 8; i++) {
+                int32_t del = curr_row[c + i] + 1;
+                int32_t min_val = (ins_arr[i] < del) ? ins_arr[i] : del;
+                curr_row[c + i + 1] = (sub_arr[i] < min_val) ? sub_arr[i] : min_val;
+            }
         }
         
-        // Store rightmost value
         out_right[r] = curr_row[TILE_SIZE];
-        
-        // Copy current row to previous row for next iteration
         memcpy(prev_row, curr_row, (TILE_SIZE + 1) * sizeof(int32_t));
     }
     
-    // Copy bottom row to output
     memcpy(out_bottom, &prev_row[1], TILE_SIZE * sizeof(int32_t));
 }
 
@@ -257,7 +242,7 @@ void *worker_thread(void *arg)
             int32_t *output_right = &ctx->v_boundaries[out_v_idx];
 
             // 3. Compute
-            compute_tile_kernel(sA, sB, input_top, input_left, top_left_corner, output_bottom, output_right);
+            compute_tile_AVX2(sA, sB, input_top, input_left, top_left_corner, output_bottom, output_right);
 
             // 4. Store Corner
             size_t corner_idx = (size_t)r * ctx->num_tiles_col + c;
