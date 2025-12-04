@@ -10,12 +10,14 @@
 #include <sched.h>
 #include "edit_distance.h"
 
-// --- Tuning Parameters ---
-#define TILE_SIZE 256
+//tile size point of control
+#define TILE_SIZE 512
+#define THREADS 64
+
+//honestly this is just here to remember
 #define ALIGNMENT 32
 
-// --- Data Structures ---
-
+//context struct for the entire program to simplify logic
 typedef struct
 {
     const char *strA;
@@ -26,7 +28,7 @@ typedef struct
     int num_tiles_row;
     int num_tiles_col;
 
-    // CHANGED: Use int32_t pointers, but we will index them with size_t
+    //boundaries are int32_t because I got a segfault and changed a bunch of stuff
     int32_t *h_boundaries;
     int32_t *v_boundaries;
     int32_t *corners;
@@ -37,15 +39,15 @@ typedef struct
     int num_threads;
 } GlobalContext;
 
+//simple struct for threads
 typedef struct
 {
     int thread_id;
     GlobalContext *ctx;
 } ThreadArgs;
 
-/*
-custom aligned allocation, which is required for SIMD AVX2 shenanigans.
-*/
+
+//custom aligned allocation, which is required for SIMD AVX2 shenanigans.
 void *aligned_malloc(size_t size)
 {
     void *ptr;
@@ -55,7 +57,7 @@ void *aligned_malloc(size_t size)
     return ptr;
 }
 
-// --- Tile Kernel (Optimized Scalar) ---
+//scalar implementation of computing a tile, mostly used for benchmarking
 void compute_tile_kernel(
     const char *subA,
     const char *subB,
@@ -95,6 +97,7 @@ void compute_tile_kernel(
     memcpy(out_bottom, &p1[1], TILE_SIZE * sizeof(int32_t));
 }
 
+//proper tile calculations using AVX2 calculations (which mostly just prerenders stuff). Check docs for explanation
 void compute_tile_AVX2(
     const char *subA,
     const char *subB,
@@ -152,19 +155,21 @@ void compute_tile_AVX2(
     memcpy(out_bottom, &prev_row[1], TILE_SIZE * sizeof(int32_t));
 }
 
-// --- Thread Worker ---
+//main thread function
 void *worker_thread(void *arg)
 {
     ThreadArgs *args = (ThreadArgs *)arg;
     GlobalContext *ctx = args->ctx;
 
+    //establishes and sets the specific thread to a cpu core on the machine
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(args->thread_id % 64, &cpuset);
+    CPU_SET(args->thread_id % THREADS, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
     while (1)
     {
+        //waits to begin, and checks to see if all waves are finished before working 
         pthread_barrier_wait(&ctx->barrier);
         if (ctx->current_wave_k == -1)
             break;
@@ -172,6 +177,7 @@ void *worker_thread(void *arg)
         while (1)
         {
             int task_idx = atomic_fetch_add(&ctx->tile_job_index, 1);
+            //this uses a queue-less method of fetching instructions by taking an atomic number-assigned space in the wave.
 
             int k = ctx->current_wave_k;
             int min_r = (k < ctx->num_tiles_col) ? 0 : (k - ctx->num_tiles_col + 1);
@@ -184,10 +190,7 @@ void *worker_thread(void *arg)
             int r = min_r + task_idx;
             int c = k - r;
 
-            // --- INDEXING FIX: Use size_t and force 64-bit math ---
-
-            // 1. Inputs
-            // String offsets (size_t to be safe)
+            //uses size_t to avoid out-of-bound segfaults for integer overflows
             const char *sA = ctx->strA + ((size_t)r * TILE_SIZE);
             const char *sB = ctx->strB + ((size_t)c * TILE_SIZE);
 
@@ -197,14 +200,15 @@ void *worker_thread(void *arg)
 
             if (r == 0)
             {
-                for (int i = 0; i < TILE_SIZE; i++)
+                for (int i = 0; i < TILE_SIZE; i++) {
                     stack_buf_top[i] = (c * TILE_SIZE) + i + 1;
+                }
                 input_top = stack_buf_top;
                 top_left_corner = (c == 0) ? 0 : (c * TILE_SIZE);
             }
             else
             {
-                // CHANGED: (size_t) casts to prevent int overflow during multiply
+                //(size_t) casts to prevent int overflow during multiply
                 size_t idx = ((size_t)(r - 1) * ctx->num_tiles_col + c) * TILE_SIZE;
                 input_top = &ctx->h_boundaries[idx];
 
@@ -228,27 +232,27 @@ void *worker_thread(void *arg)
             }
             else
             {
-                // CHANGED: (size_t) casts
+                //(size_t) casts
                 size_t idx = ((size_t)r * ctx->num_tiles_col + (c - 1)) * TILE_SIZE;
                 input_left = &ctx->v_boundaries[idx];
             }
 
-            // 2. Outputs
-            // CHANGED: (size_t) casts
+            //outputs
             size_t out_h_idx = ((size_t)r * ctx->num_tiles_col + c) * TILE_SIZE;
             int32_t *output_bottom = &ctx->h_boundaries[out_h_idx];
 
             size_t out_v_idx = ((size_t)r * ctx->num_tiles_col + c) * TILE_SIZE;
             int32_t *output_right = &ctx->v_boundaries[out_v_idx];
 
-            // 3. Compute
+            //compute
             compute_tile_AVX2(sA, sB, input_top, input_left, top_left_corner, output_bottom, output_right);
 
-            // 4. Store Corner
+            //store Corner
             size_t corner_idx = (size_t)r * ctx->num_tiles_col + c;
             ctx->corners[corner_idx] = output_right[TILE_SIZE - 1];
         }
 
+        //ending barrier to ensure synchronization
         pthread_barrier_wait(&ctx->barrier);
     }
     return NULL;
@@ -263,14 +267,14 @@ int levenshtein_tiled(const char *s1, const char *s2, int len, int num_threads)
     ctx.lenB = len;
     ctx.num_threads = num_threads;
 
-    // note: these are using the padding algorithm to ensure a clean tiling
+    //note: these are using the padding algorithm to ensure a clean tiling
     ctx.num_tiles_row = (len + TILE_SIZE - 1) / TILE_SIZE;
     ctx.num_tiles_col = (len + TILE_SIZE - 1) / TILE_SIZE;
 
     size_t num_blocks = (size_t)ctx.num_tiles_row * ctx.num_tiles_col;
 
-    // Check for OOM / Safe Allocation
-    // Note: calloc takes size_t, so we are good if we cast
+    //check for Safe Allocation
+    //note: calloc takes size_t, so we are good if we cast
     printf("Allocating %.2f GB for boundaries...\n", (double)(num_blocks * TILE_SIZE * 4 * 2) / 1024 / 1024 / 1024);
 
     ctx.h_boundaries = calloc(num_blocks * TILE_SIZE, sizeof(int32_t));
@@ -327,13 +331,11 @@ int levenshtein_tiled(const char *s1, const char *s2, int len, int num_threads)
 int cse2421_edit_distance(const char *str1, const char *str2, size_t len)
 {
 
-    // initialize a default amount of threads for the linux box
-    int threads = 64;
 
     // pads out the strings to a clean multiple of the tile size to make handing boundaries simpler with minimal performance consequences
     size_t padded_len = ((len + TILE_SIZE - 1) / TILE_SIZE) * TILE_SIZE;
 
-    printf("Length: %zu (Padded: %zu), Threads: %d\n", len, padded_len, threads);
+    printf("Length: %zu (Padded: %zu), Threads: %d\n", len, padded_len, THREADS);
 
     // standardized lengths to be susceptible to complete tiling over the strings' array
     char *str1_padded = aligned_malloc((size_t)padded_len + 1);
@@ -356,7 +358,7 @@ int cse2421_edit_distance(const char *str1, const char *str2, size_t len)
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    int dist = levenshtein_tiled(str1_padded, str2_padded, padded_len, threads);
+    int dist = levenshtein_tiled(str1_padded, str2_padded, padded_len, THREADS);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     double t = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
